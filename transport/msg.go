@@ -180,8 +180,8 @@ func split(buf []byte, lim int) [][]byte {
 
 type FQDN string
 
-// PreparePartitionedPayload Gets a big payload that needs to be sent over the wire, chops it up into smaller limbs and creates a list of messages to be sent. It also sends the parentPartID to make sure the series
-// of messages are not lost
+// PreparePartitionedPayload Gets a big payload that needs to be sent over the wire, chops it up into smaller limbs and creates a
+// list of messages to be sent. It also sends the parentPartID to make sure the series of messages are not lost
 func PreparePartitionedPayload(msg MessagePacket, payload []byte, dnsSuffix string, privateKey *cryptography.PrivateKey, serverPublicKey *cryptography.PublicKey) ([]FQDN, PartID, error) {
 	// TODO: fix duplicate sending
 
@@ -204,10 +204,11 @@ func PreparePartitionedPayload(msg MessagePacket, payload []byte, dnsSuffix stri
 	var err error
 	var response []FQDN
 	var parentPartID PartID = 0
+	msg.Metadata = msg.Metadata.SetIsLastPart(true) // if the message is only one part, the last part is always true
 	// retryCount := 1 //todo: retry of >1 could cause message duplicates
 	limbs := split(payload, int(ChunkSize))
 	if len(limbs) > 1 {
-		msg.Metadata.SetIsLastPart(false)
+		msg.Metadata = msg.Metadata.SetIsLastPart(false)
 		msg.PartID = 0
 		msg.ParentPartID = PartID(uint16(rand.Uint32()) + 1)
 		parentPartID = msg.ParentPartID
@@ -218,7 +219,7 @@ func PreparePartitionedPayload(msg MessagePacket, payload []byte, dnsSuffix stri
 		// 	return response, parentPartID, errors.New("failed to send message after 10 attempts")
 		// }
 		if i == len(limbs)-1 && len(limbs) > 1 {
-			msg.Metadata.SetIsLastPart(true)
+			msg.Metadata = msg.Metadata.SetIsLastPart(true)
 		}
 		// msg.Payload = []byte{}
 		// msg.PayloadLength = uint8(copy(msg.Payload[:], limbs[i]))

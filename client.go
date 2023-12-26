@@ -13,7 +13,7 @@ import (
 	"github.com/mosajjal/dnsconn/transport"
 )
 
-// implements net.PacketConn
+// implements net.Conn
 type client struct {
 	// transport related fields
 	privateKey      *cryptography.PrivateKey // private key of the client for decrypting and signing the messages
@@ -28,6 +28,7 @@ type client struct {
 	readBuf       []byte                                                      // raw bytes buffer. TODO: add max size
 	readCtx       context.Context                                             // used in Read function when setReadDeadline is used
 	readLock      sync.Mutex                                                  // used to lock the readBuf
+	connected     chan struct{}
 
 	// write related fields
 	writeBuf  []byte          // outgoing buffer
@@ -64,7 +65,7 @@ func (c *client) sendQuestionToServer(Q transport.FQDN) error {
 		return fmt.Errorf("failed to send the payload: %s", err)
 	}
 	msgList, skip, err := transport.DecryptIncomingPacket(response, c.dnsSuffix, c.privateKey, c.serverPublicKey)
-	if err != nil && !skip {
+	if err != nil {
 		return fmt.Errorf("error in decrypting incoming packet from server: %s", err)
 	} else if !skip {
 		// if we're not skipping, and there's an actual payload from the server, we need to check if it's a multipart or not. if it is
@@ -74,10 +75,14 @@ func (c *client) sendQuestionToServer(Q transport.FQDN) error {
 		parentPartID := transport.PartID(0)
 		// push the messages one by one to readPacketBuf based on their parent part id
 		for _, msg := range msgList {
+			if _, ok := c.readPacketBuf[msg.Msg.ParentPartID]; !ok {
+				c.readPacketBuf[msg.Msg.ParentPartID] = make([]transport.MessagePacketWithSignature, 0)
+				c.readLock.Lock()
+			}
+
 			// if the incoming packet is a result of client sending to the server, the CNAME returned is just a "pong" acknowledgement
 			// so we'll focus on only server to client packets that actuallly have useful data in the CNAME payload
 			if msgList[0].Msg.Metadata.IsServer2Client() {
-
 				c.readPacketBuf[msg.Msg.ParentPartID] = append(c.readPacketBuf[msg.Msg.ParentPartID], msg)
 				if parentPartID == 0 {
 					parentPartID = msg.Msg.ParentPartID
@@ -88,10 +93,10 @@ func (c *client) sendQuestionToServer(Q transport.FQDN) error {
 			if msg.Msg.Metadata.IsLastPart() {
 				if incomingPayload, err := c.grabFullPayload(parentPartID); err == nil {
 					c.readInterval = 50 * time.Millisecond
-					c.readLock.Lock()
 					c.readBuf = append(c.readBuf, incomingPayload...)
 					c.readLock.Unlock()
 				}
+				// this is where the Read() function can stop blocking
 			}
 		}
 
@@ -106,7 +111,7 @@ func (c *client) sendQuestionToServer(Q transport.FQDN) error {
 //   - serverPublicKey: the public key of the server. cannot be empty
 //   - DNSSuffix: the DNS suffix of the server. cannot be empty and MUST have a trailing and leading dot
 //   - resolver: the address of the DNS server to send the queries to. can be nil in which case OS's default resolver will be used
-func DialDNST(privateKey *cryptography.PrivateKey, serverPublicKey *cryptography.PublicKey, DNSSuffix string, resolver net.Addr) net.PacketConn {
+func DialDNST(privateKey *cryptography.PrivateKey, serverPublicKey *cryptography.PublicKey, DNSSuffix string, resolver net.Addr) net.Conn {
 	if privateKey == nil {
 		// generate a new private key
 		privateKey, _ = cryptography.GenerateKey()
@@ -128,9 +133,12 @@ func DialDNST(privateKey *cryptography.PrivateKey, serverPublicKey *cryptography
 	client.writeBuf = make([]byte, 0)
 	client.writeCtx = context.Background()
 	client.writeLock = sync.Mutex{}
+	client.connected = make(chan struct{}, 1)
 
 	go client.startRead()
 	go client.startWrite()
+	// BUG: client won't want and just quits on this
+	<-client.connected
 	return client
 
 }
@@ -149,13 +157,16 @@ func (c *client) startWrite() {
 					TimeStamp: uint32(time.Now().Unix()),
 					Metadata:  transport.PacketMetaData(0),
 				}
-				msg.Metadata = msg.Metadata.SetIsServer2Client(true)
+				msg.Metadata = msg.Metadata.SetIsClient2Server(true)
 				questions, _, err := transport.PreparePartitionedPayload(msg, c.writeBuf, c.dnsSuffix, c.privateKey, c.serverPublicKey)
 				if err != nil {
 					slog.Error("failed to prepare payload", err)
 				}
 				for _, question := range questions {
-					c.sendQuestionToServer(question)
+					err := c.sendQuestionToServer(question)
+					if err != nil {
+						slog.Error("failed to send question", err)
+					}
 				}
 				c.writeBuf = make([]byte, 0)
 			}
@@ -190,25 +201,25 @@ func (c *client) startRead() {
 			if err != nil {
 				slog.Error("failed to send healthcheck", "error", err)
 			}
+			c.connected <- struct{}{}
 			time.Sleep(c.readInterval)
 		}
 	}
 }
 
 // ReadFrom checks the buffer and returns everything inside it. the buffer is then flushed
-func (c *client) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+func (c *client) Read(b []byte) (n int, err error) {
 	c.readLock.Lock()
 	defer c.readLock.Unlock()
 	n = copy(b, c.readBuf)
 	c.readBuf = c.readBuf[n:]
 
-	addr = &DNSTAddr{pubKey: *c.serverPublicKey}
 	return
 }
 
 // WriteTo sends the payload to the server as series of DNS A queries
 // addr is ignored and is always replaced by the server's public key
-func (c *client) WriteTo(b []byte, addr net.Addr) (n int, err error) {
+func (c *client) Write(b []byte) (n int, err error) {
 	c.writeLock.Lock()
 	defer c.writeLock.Unlock()
 	c.writeBuf = append(c.writeBuf, b...)
@@ -225,6 +236,10 @@ func (c *client) Close() error {
 // LocalAddr returns the local network address
 func (c *client) LocalAddr() net.Addr {
 	return &DNSTAddr{pubKey: c.privateKey.GetPublicKey()}
+}
+
+func (c *client) RemoteAddr() net.Addr {
+	return &DNSTAddr{pubKey: *c.serverPublicKey}
 }
 
 func (c *client) SetDeadline(t time.Time) error {

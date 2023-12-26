@@ -1,9 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/mosajjal/dnsconn"
 	"github.com/mosajjal/dnsconn/cryptography"
@@ -24,6 +24,7 @@ func main() {
 	}
 	defer pc.Close()
 
+	// TODO: this can have a client handler function that will be called when a new client connects. each function will be run out of a separate goroutine
 	dnsPc, err := dnsconn.ListenDNST(privateKey, pc, ".example.com.", nil)
 	if err != nil {
 		panic(err)
@@ -32,9 +33,32 @@ func main() {
 	defer dnsPc.Close()
 	// make it ping pong
 	for {
-		// list active clients every 3 seconds
-		time.Sleep(3 * time.Second)
-		fmt.Printf("Active clients: %+#v\n", dnsPc.ListActiveClientPubKeys())
+		// Accept new connections
+		conn, err := dnsPc.Accept()
+		if err != nil {
+			fmt.Println(err)
+		}
+		// Handle new connections in a Goroutine for concurrency
+		handleConnection(conn)
 	}
 
+}
+
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+
+	for {
+		// Read from the connection untill a new line is send
+		data, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			fmt.Printf("error2: %s\n", err)
+			return
+		}
+
+		// Print the data read from the connection to the terminal
+		fmt.Print("> ", string(data))
+
+		// Write back the same message to the client
+		conn.Write([]byte("Hello TCP Client\n"))
+	}
 }

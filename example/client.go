@@ -1,9 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"net"
-	"time"
+	"os"
 
 	"github.com/mosajjal/dnsconn"
 	"github.com/mosajjal/dnsconn/cryptography"
@@ -15,13 +16,24 @@ func main() {
 
 	serverPubcliKey, _ := cryptography.PublicKeyFromString("iwtvpoygxxils8bc9ghss6nf6g0r67b7s4h88xik8c0vv3yi40")
 
-	clientPc := dnsconn.DialDNST(privateKey, serverPubcliKey, ".example.com.", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5300})
-	defer clientPc.Close()
+	conn := dnsconn.DialDNST(privateKey, serverPubcliKey, ".example.com.", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5300})
+	defer conn.Close()
 
-	for {
-		// list active clients every 3 seconds
-		time.Sleep(3 * time.Second)
-		fmt.Printf("Active clients: %+#v\n", clientPc)
+	// Send a message to the server
+	_, err := conn.Write([]byte("Hello TCP Server\n"))
+	if err != nil {
+		fmt.Printf("Error: %s\n", err)
+		os.Exit(1)
 	}
+
+	// Read from the connection untill a new line is send
+	data, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		fmt.Printf("Error2: %s\n", err)
+		return
+	}
+
+	// Print the data read from the connection to the terminal
+	fmt.Print("> ", string(data))
 
 }
