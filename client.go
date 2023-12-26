@@ -50,7 +50,7 @@ func (c *client) grabFullPayload(parentPartID transport.PartID) ([]byte, error) 
 	}
 	delete(c.readPacketBuf, packets[0].Msg.ParentPartID)
 	// assuming this is the last part and we're going back to the normal interval
-	c.readInterval = 5 * time.Second
+	c.readInterval = 2 * time.Second
 	return bytes.Trim(fullPayload, "\x00"), nil
 
 }
@@ -83,6 +83,7 @@ func (c *client) sendQuestionToServer(Q transport.FQDN) error {
 			// if the incoming packet is a result of client sending to the server, the CNAME returned is just a "pong" acknowledgement
 			// so we'll focus on only server to client packets that actuallly have useful data in the CNAME payload
 			if msgList[0].Msg.Metadata.IsServer2Client() {
+				c.readInterval = 50 * time.Millisecond // speed things up because tehre's a next message coming in
 				c.readPacketBuf[msg.Msg.ParentPartID] = append(c.readPacketBuf[msg.Msg.ParentPartID], msg)
 				if parentPartID == 0 {
 					parentPartID = msg.Msg.ParentPartID
@@ -92,7 +93,6 @@ func (c *client) sendQuestionToServer(Q transport.FQDN) error {
 			// if the packet from the server is the last part, we can start reconstructing the payload
 			if msg.Msg.Metadata.IsLastPart() {
 				if incomingPayload, err := c.grabFullPayload(parentPartID); err == nil {
-					c.readInterval = 50 * time.Millisecond
 					c.readBuf = append(c.readBuf, incomingPayload...)
 					c.readLock.Unlock()
 				}
@@ -128,7 +128,7 @@ func DialDNST(privateKey *cryptography.PrivateKey, serverPublicKey *cryptography
 	client.readBuf = make([]byte, 0)
 	client.readCtx = context.Background()
 	client.readLock = sync.Mutex{}
-	client.readInterval = 5 * time.Second
+	client.readInterval = 1 * time.Second
 
 	client.writeBuf = make([]byte, 0)
 	client.writeCtx = context.Background()
@@ -148,6 +148,24 @@ func (c *client) startWrite() {
 	for {
 		select {
 		case <-c.writeCtx.Done():
+			msg := transport.MessagePacket{
+				TimeStamp: uint32(time.Now().Unix()),
+				Metadata:  transport.PacketMetaData(0),
+			}
+			msg.Metadata = msg.Metadata.SetIsClosing(true)
+			payload := []byte("closing!")
+			// we expect questions to be an array of one, since the payload is empty
+			questions, _, err := transport.PreparePartitionedPayload(msg, payload, c.dnsSuffix, c.privateKey, c.serverPublicKey)
+			if err != nil {
+				slog.Error("failed to prepare payload",
+					"error", err)
+			}
+			// send the close payload to the server
+			err = c.sendQuestionToServer(questions[0])
+			if err != nil {
+				slog.Error("failed to send close payload",
+					"error", err)
+			}
 			return
 		default:
 			c.writeLock.Lock()
@@ -160,12 +178,14 @@ func (c *client) startWrite() {
 				msg.Metadata = msg.Metadata.SetIsClient2Server(true)
 				questions, _, err := transport.PreparePartitionedPayload(msg, c.writeBuf, c.dnsSuffix, c.privateKey, c.serverPublicKey)
 				if err != nil {
-					slog.Error("failed to prepare payload", err)
+					slog.Error("failed to prepare payload",
+						"error", err)
 				}
 				for _, question := range questions {
 					err := c.sendQuestionToServer(question)
 					if err != nil {
-						slog.Error("failed to send question", err)
+						slog.Error("failed to send question",
+							"error", err)
 					}
 				}
 				c.writeBuf = make([]byte, 0)
@@ -179,11 +199,13 @@ func (c *client) startWrite() {
 // startRead starts a goroutine that sends healthchecks to the server. the server can send the payload as CNAME response to the healthchecks
 // if there's any data recieved, it'll be stored inside a buffer and will be passed on to the Read function as a FIFO
 func (c *client) startRead() {
+	ticker := time.NewTicker(c.readInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-c.readCtx.Done():
 			return
-		default:
+		case <-ticker.C:
 			msg := transport.MessagePacket{
 				TimeStamp: uint32(time.Now().Unix()),
 				Metadata:  transport.PacketMetaData(0),
@@ -194,15 +216,16 @@ func (c *client) startRead() {
 			// we expect questions to be an array of one, since the payload is empty
 			questions, _, err := transport.PreparePartitionedPayload(msg, payload, c.dnsSuffix, c.privateKey, c.serverPublicKey)
 			if err != nil {
-				slog.Error("failed to prepare payload", err)
+				slog.Error("failed to prepare payload",
+					"error", err)
 			}
 			// send the healthcheck to the server. the response of this has the server payload inside of it.
 			err = c.sendQuestionToServer(questions[0])
 			if err != nil {
-				slog.Error("failed to send healthcheck", "error", err)
+				slog.Error("failed to send healthcheck",
+					"error", err)
 			}
 			c.connected <- struct{}{}
-			time.Sleep(c.readInterval)
 		}
 	}
 }

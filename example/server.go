@@ -25,21 +25,21 @@ func main() {
 	defer pc.Close()
 
 	// TODO: this can have a client handler function that will be called when a new client connects. each function will be run out of a separate goroutine
-	dnsPc, err := dnsconn.ListenDNST(privateKey, pc, ".example.com.", nil)
+	dnstListener, err := dnsconn.ListenDNST(privateKey, pc, ".example.com.", nil)
 	if err != nil {
 		panic(err)
 	}
 
-	defer dnsPc.Close()
+	defer dnstListener.Close()
 	// make it ping pong
 	for {
 		// Accept new connections
-		conn, err := dnsPc.Accept()
+		conn, err := dnstListener.Accept()
 		if err != nil {
 			fmt.Println(err)
 		}
 		// Handle new connections in a Goroutine for concurrency
-		handleConnection(conn)
+		go handleConnection(conn)
 	}
 
 }
@@ -47,18 +47,17 @@ func main() {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	for {
-		// Read from the connection untill a new line is send
-		data, err := bufio.NewReader(conn).ReadString('\n')
-		if err != nil {
-			fmt.Printf("error2: %s\n", err)
-			return
-		}
-
-		// Print the data read from the connection to the terminal
-		fmt.Print("> ", string(data))
-
-		// Write back the same message to the client
-		conn.Write([]byte("Hello TCP Client\n"))
+	// Read from the connection untill a new line is send
+	data, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		fmt.Printf("error2: %s\n", err)
+		return
 	}
+
+	// Print the data read from the connection to the terminal
+	fmt.Print("> ", string(data))
+
+	// Write back the same message to the client
+	conn.Write([]byte("Hello TCP Client\n"))
+
 }

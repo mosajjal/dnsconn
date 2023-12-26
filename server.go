@@ -14,6 +14,10 @@ import (
 	"github.com/mosajjal/dnsconn/transport"
 )
 
+const (
+	defaultCleanupInterval = time.Minute
+)
+
 type DNSTAddr struct {
 	pubKey cryptography.PublicKey
 }
@@ -105,6 +109,7 @@ func ListenDNST(privateKey *cryptography.PrivateKey, listener net.PacketConn, dn
 		PacketConn: listener,
 	}
 	go dnsServer.ActivateAndServe()
+	go server.cleanupDeadClients()
 	return server, nil
 }
 
@@ -118,23 +123,23 @@ func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 	case dns.OpcodeQuery:
 		payloads, skip, err := transport.DecryptIncomingPacket(m, s.DNSSuffix, s.privateKey, nil)
 		if skip || err != nil {
-			slog.Warn("failed to decrypt incoming packet", err)
+			slog.Warn("failed to decrypt incoming packet",
+				"error", err)
 			return
 		}
 		for _, payload := range payloads {
 			// determine the direction of the traffic
 			if payload.Msg.Metadata.IsServer2Client() {
 				s.handleServerToClient(w, m, payload)
-
 			}
 			if payload.Msg.Metadata.IsClient2Server() {
 				s.handleClientToServer(w, m, payload)
 			}
+			if payload.Msg.Metadata.IsClosing() {
+				s.handleClosing(w, m, payload)
+			}
 		}
 	}
-	// if err := w.WriteMsg(m); err != nil {
-	// 	slog.Warn("failed to write response", err)
-	// }
 }
 
 func (s *Server) initiateNewClient(payload *transport.MessagePacketWithSignature) *clientStatus {
@@ -164,7 +169,8 @@ func (s *clientStatus) prepareEncryptedPong() transport.FQDN {
 
 	cnames, _, err := transport.PreparePartitionedPayload(msg, []byte("pong!"), s.DNSSuffix, s.privateKey, &s.remoteAddr.pubKey)
 	if err != nil {
-		slog.Error("failed to prepare payload", err)
+		slog.Error("failed to prepare payload",
+			"error", err)
 	}
 	return cnames[0]
 }
@@ -185,11 +191,13 @@ func (s *Server) handleServerToClient(w dns.ResponseWriter, r *dns.Msg, emptyPay
 	}
 	cname, err := dns.NewRR(fmt.Sprintf("%s CNAME %s", r.Question[0].Name, fqdn))
 	if err != nil {
-		slog.Error("failed to create CNAME", err)
+		slog.Error("failed to create CNAME",
+			"error", err)
 	}
 	r.Answer = append(r.Answer, cname)
 	if err := w.WriteMsg(r); err != nil {
-		slog.Warn("failed to write response", err)
+		slog.Warn("failed to write response",
+			"error", err)
 	}
 }
 
@@ -226,17 +234,49 @@ func (s *Server) handleClientToServer(w dns.ResponseWriter, r *dns.Msg, payload 
 
 	cnames, _, err := transport.PreparePartitionedPayload(msg, []byte("pong!"), s.DNSSuffix, s.privateKey, payload.Signature)
 	if err != nil {
-		slog.Error("failed to prepare payload", err)
+		slog.Error("failed to prepare payload",
+			"error", err)
 	}
 	cname, err := dns.NewRR(fmt.Sprintf("%s CNAME %s", r.Question[0].Name, cnames[0]))
 	if err != nil {
-		slog.Error("failed to create CNAME", err)
+		slog.Error("failed to create CNAME",
+			"error", err)
 	}
 	r.Answer = append(r.Answer, cname)
 	if err := w.WriteMsg(r); err != nil {
-		slog.Warn("failed to write response", err)
+		slog.Warn("failed to write response",
+			"error", err)
 	}
 
+}
+
+// handleClosing handles DNS packets that are coming in from the client that has the closing flag set.
+func (s *Server) handleClosing(w dns.ResponseWriter, r *dns.Msg, payload transport.MessagePacketWithSignature) {
+	// let's find the client first
+	client, ok := s.clients[payload.Signature.String()]
+	if !ok {
+		slog.Warn("client is sending a closing packet but they don't exist anyway")
+		return
+	}
+	// delete the client item
+	delete(s.clients, payload.Signature.String())
+	client.Close()
+}
+
+// cleanupDeadClients deletes the clients that have been idle for too long
+// this function should be called as a goroutine
+func (s *Server) cleanupDeadClients() {
+	ticker := time.NewTicker(defaultCleanupInterval)
+	defer ticker.Stop()
+	for {
+		<-ticker.C
+		for k, v := range s.clients {
+			lastSeen := time.Unix(int64(v.LastAckFromAgentPacketTime), 0)
+			if time.Since(lastSeen) > defaultCleanupInterval {
+				delete(s.clients, k)
+			}
+		}
+	}
 }
 
 func (s *Server) Close() error {
@@ -278,7 +318,8 @@ func (s *clientStatus) Write(b []byte) (n int, err error) {
 
 	fqdns, _, err := transport.PreparePartitionedPayload(msg, b, s.DNSSuffix, s.privateKey, &s.remoteAddr.pubKey)
 	if err != nil {
-		slog.Error("failed to prepare payload", err)
+		slog.Error("failed to prepare payload:",
+			"error", err)
 	}
 	s.OutPush(msg.PartID, fqdns...)
 
@@ -286,7 +327,6 @@ func (s *clientStatus) Write(b []byte) (n int, err error) {
 }
 
 func (s *clientStatus) Close() error {
-	// TODO: implement
 	return nil
 }
 func (s *clientStatus) LocalAddr() net.Addr {
