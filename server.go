@@ -32,33 +32,25 @@ func (a *DNSTAddr) String() string {
 
 // implements net.Conn
 type clientStatus struct {
+	ConnID                     transport.ConnID
 	LastAckFromAgentServerTime uint32
 	LastAckFromAgentPacketTime uint32
-	inPacketBuffer             map[transport.PartID][]transport.MessagePacketWithSignature
+	inPacketBuffer             []transport.MessagePacketWithSignature
 	inBuffer                   chan []byte
 	outLock                    *sync.Mutex
-	outPacketBuffer            map[transport.PartID][]transport.FQDN
+	outPacketBuffer            []transport.FQDN
 
 	privateKey *cryptography.PrivateKey
 	remoteAddr DNSTAddr
 	DNSSuffix  string
 }
 
-func (c *clientStatus) OutPop(partID transport.PartID) transport.FQDN {
-	// pops the first element of outPacketBuffer[partID]
-	c.outLock.Lock()
-	defer c.outLock.Unlock()
-	if len(c.outPacketBuffer[partID]) == 0 {
-		return c.prepareEncryptedPong()
-	}
-	fqdn := c.outPacketBuffer[partID][0]
-	c.outPacketBuffer[partID] = c.outPacketBuffer[partID][1:]
-	return fqdn
-}
-func (c *clientStatus) OutPush(partID transport.PartID, fqdns ...transport.FQDN) {
-	c.outLock.Lock()
-	defer c.outLock.Unlock()
-	c.outPacketBuffer[partID] = append(c.outPacketBuffer[partID], fqdns...)
+// ClientKeyConnID is a string composite type that's built with the client's public key string + the connection ID
+// example: iwtvpoygxxils8bc9ghss6nf6g0r67b7s4h88xik8c0vv3yi40 + 41212 = iwtvpoygxxils8bc9ghss6nf6g0r67b7s4h88xik8c0vv3yi4041212
+type ClientKeyConnID string
+
+func (s *Server) deriveClientKeyConnID(payload *transport.MessagePacketWithSignature) ClientKeyConnID {
+	return ClientKeyConnID(string(payload.Signature.String()) + string(payload.Msg.ConnID))
 }
 
 // implements net.Listener
@@ -66,8 +58,9 @@ type Server struct {
 	Listener           net.PacketConn // DNS Tunnel works on top of a dns server (udp, tcp, tls, unix socket etc). The design is decoupled from the nature of the socket
 	DNSSuffix          string         // top level suffix expected
 	privateKey         *cryptography.PrivateKey
-	acceptedClientKeys []*cryptography.PublicKey                   // if not empty, only comms from these keys will be accepted
-	clients            map[cryptography.PublicKeyStr]*clientStatus // list of current clients. key can't be the actual public key because golang doesn't support struct custom equal functions. need to use the string
+	acceptedClientKeys []*cryptography.PublicKey         // if not empty, only comms from these keys will be accepted
+	clients            map[ClientKeyConnID]*clientStatus // list of current clients. key can't be the actual public key because golang doesn't support struct custom equal functions. need to use the string
+	clientLock         sync.Mutex
 	latestClient       chan *clientStatus
 	// dedupPrevMsgHash is only for consecutive message duplicates
 	dedupPrevMsgHash uint64 // since dns servers send multiple queries at the same time, simple dedup helps
@@ -97,7 +90,8 @@ func ListenDNST(privateKey *cryptography.PrivateKey, listener net.PacketConn, dn
 		DNSSuffix:          dnsSuffix,
 		privateKey:         privateKey,
 		acceptedClientKeys: acceptedClientKeys,
-		clients:            make(map[cryptography.PublicKeyStr]*clientStatus),
+		clients:            make(map[ClientKeyConnID]*clientStatus),
+		clientLock:         sync.Mutex{},
 		latestClient:       make(chan *clientStatus, 1),
 		dedupPrevMsgHash:   0,
 		ctx:                context.Background(),
@@ -143,31 +137,31 @@ func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 }
 
 func (s *Server) initiateNewClient(payload *transport.MessagePacketWithSignature) *clientStatus {
-	s.clients[payload.Signature.String()] = &clientStatus{
+	k := s.deriveClientKeyConnID(payload)
+	s.clientLock.Lock()
+
+	s.clients[k] = &clientStatus{
+		ConnID:                     payload.Msg.ConnID,
 		LastAckFromAgentServerTime: uint32(time.Now().Unix()),
 		LastAckFromAgentPacketTime: payload.Msg.TimeStamp,
-		inPacketBuffer:             make(map[transport.PartID][]transport.MessagePacketWithSignature),
+		inPacketBuffer:             make([]transport.MessagePacketWithSignature, 0),
 		inBuffer:                   make(chan []byte, 1),
 		outLock:                    &sync.Mutex{},
-		outPacketBuffer:            make(map[transport.PartID][]transport.FQDN),
+		outPacketBuffer:            make([]transport.FQDN, 0),
 
 		privateKey: s.privateKey,
 		remoteAddr: DNSTAddr{pubKey: *payload.Signature},
 		DNSSuffix:  s.DNSSuffix,
 	}
-	return s.clients[payload.Signature.String()]
+	s.clientLock.Unlock()
+	return s.clients[k]
 }
 
 // prepareEncryptedPong prepares a pong! message for the client
 func (s *clientStatus) prepareEncryptedPong() transport.FQDN {
-	msg := transport.MessagePacket{
-		TimeStamp: uint32(time.Now().Unix()),
-		Metadata:  transport.PacketMetaData(0),
-	}
-	msg.Metadata = msg.Metadata.SetIsLastPart(true)
-	msg.Metadata = msg.Metadata.SetIsClosing(true)
+	metadata := transport.PacketMetaData(0).SetIsLastPart(true).SetIsClosing(true)
 
-	cnames, _, err := transport.PreparePartitionedPayload(msg, []byte("pong!"), s.DNSSuffix, s.privateKey, &s.remoteAddr.pubKey)
+	cnames, _, err := transport.PreparePartitionedPayload(metadata, s.ConnID, []byte("pong!"), s.DNSSuffix, s.privateKey, &s.remoteAddr.pubKey)
 	if err != nil {
 		slog.Error("failed to prepare payload",
 			"error", err)
@@ -178,8 +172,9 @@ func (s *clientStatus) prepareEncryptedPong() transport.FQDN {
 func (s *Server) handleServerToClient(w dns.ResponseWriter, r *dns.Msg, emptyPayload transport.MessagePacketWithSignature) {
 	// the payload should be empty, respond with a CNAME containing the intended payload buffer. if we have nothing to send, respond with a healthcheck
 	var fqdn transport.FQDN
+	k := s.deriveClientKeyConnID(&emptyPayload)
 	// check to see if this is the first time we're seeing this client. TODO: should we just fail here and wait for a client to exist before sending data to it?
-	if client, ok := s.clients[emptyPayload.Signature.String()]; !ok {
+	if client, ok := s.clients[k]; !ok {
 		// this would be a brand new healthcheck message coming from the client. healthchecks form the clients are actually
 		// sent as server2client because their main purpose is to grab the data as CNAMEs in response
 		client = s.initiateNewClient(&emptyPayload)
@@ -187,7 +182,11 @@ func (s *Server) handleServerToClient(w dns.ResponseWriter, r *dns.Msg, emptyPay
 		// if this is a new client, we don't have anything to send to it yet. so we'll respond with an empty CNAME
 		fqdn = client.prepareEncryptedPong()
 	} else {
-		fqdn = client.OutPop(emptyPayload.Msg.PartID)
+		// pop the first item from the out buffer
+		client.outLock.Lock()
+		fqdn = client.outPacketBuffer[0]
+		client.outPacketBuffer = client.outPacketBuffer[1:]
+		client.outLock.Unlock()
 	}
 	cname, err := dns.NewRR(fmt.Sprintf("%s CNAME %s", r.Question[0].Name, fqdn))
 	if err != nil {
@@ -203,19 +202,19 @@ func (s *Server) handleServerToClient(w dns.ResponseWriter, r *dns.Msg, emptyPay
 
 func (s *Server) handleClientToServer(w dns.ResponseWriter, r *dns.Msg, payload transport.MessagePacketWithSignature) {
 	// read the payload, decrypt and verify, and add it to the buffer for the client's public key
-
+	k := s.deriveClientKeyConnID(&payload)
 	// check to see if this is the first time we're seeing this client
-	if client, ok := s.clients[payload.Signature.String()]; !ok {
+	if client, ok := s.clients[k]; !ok {
 		// since any "normal" client starts by sending a healthcheck, they should be already reigstered on the handleServer2Client function
 		// and this should be a very rare case
 		slog.Warn("client is sending a payload before sending a healthcheck")
 		client = s.initiateNewClient(&payload)
 		s.latestClient <- client
 	} else {
-		client.inPacketBuffer[payload.Msg.PartID] = append(client.inPacketBuffer[payload.Msg.PartID], payload)
+		client.inPacketBuffer = append(client.inPacketBuffer, payload)
 		if payload.Msg.Metadata.IsLastPart() {
 			// order and clean up all the payloads
-			packets := transport.CheckMessageIntegrity(client.inPacketBuffer[payload.Msg.PartID])
+			packets := transport.CheckMessageIntegrity(client.inPacketBuffer)
 			if packets == nil {
 				// the payload does not have the last packet, we should return an empty payload and an error
 				slog.Warn("failed to check message integrity")
@@ -224,15 +223,11 @@ func (s *Server) handleClientToServer(w dns.ResponseWriter, r *dns.Msg, payload 
 				packetPayload := packet.Msg.Payload[:]
 				client.inBuffer <- packetPayload
 			}
-			delete(client.inPacketBuffer, payload.Msg.PartID)
+			client.inPacketBuffer = make([]transport.MessagePacketWithSignature, 0)
 		}
 	}
 
-	msg := transport.MessagePacket{
-		TimeStamp: uint32(time.Now().Unix()),
-	}
-
-	cnames, _, err := transport.PreparePartitionedPayload(msg, []byte("pong!"), s.DNSSuffix, s.privateKey, payload.Signature)
+	cnames, _, err := transport.PreparePartitionedPayload(transport.PacketMetaData(0), payload.Msg.ConnID, []byte("pong!"), s.DNSSuffix, s.privateKey, payload.Signature)
 	if err != nil {
 		slog.Error("failed to prepare payload",
 			"error", err)
@@ -253,13 +248,14 @@ func (s *Server) handleClientToServer(w dns.ResponseWriter, r *dns.Msg, payload 
 // handleClosing handles DNS packets that are coming in from the client that has the closing flag set.
 func (s *Server) handleClosing(w dns.ResponseWriter, r *dns.Msg, payload transport.MessagePacketWithSignature) {
 	// let's find the client first
-	client, ok := s.clients[payload.Signature.String()]
+	k := s.deriveClientKeyConnID(&payload)
+	client, ok := s.clients[k]
 	if !ok {
 		slog.Warn("client is sending a closing packet but they don't exist anyway")
 		return
 	}
 	// delete the client item
-	delete(s.clients, payload.Signature.String())
+	delete(s.clients, k)
 	client.Close()
 }
 
@@ -294,14 +290,6 @@ func (s *Server) Accept() (net.Conn, error) {
 	return c, nil
 }
 
-func (s *Server) ListActiveClientPubKeys() []cryptography.PublicKeyStr {
-	var keys []cryptography.PublicKeyStr
-	for k := range s.clients {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
 func (s *clientStatus) Read(b []byte) (n int, err error) {
 	tmpBuf := <-s.inBuffer
 	n = copy(b, tmpBuf)
@@ -310,19 +298,16 @@ func (s *clientStatus) Read(b []byte) (n int, err error) {
 
 func (s *clientStatus) Write(b []byte) (n int, err error) {
 
-	msg := transport.MessagePacket{
-		TimeStamp: uint32(time.Now().Unix()),
-		Metadata:  transport.PacketMetaData(0),
-	}
-	msg.Metadata = msg.Metadata.SetIsServer2Client(true)
+	metadata := transport.PacketMetaData(0).SetIsServer2Client(true)
 
-	fqdns, _, err := transport.PreparePartitionedPayload(msg, b, s.DNSSuffix, s.privateKey, &s.remoteAddr.pubKey)
+	fqdns, _, err := transport.PreparePartitionedPayload(metadata, s.ConnID, b, s.DNSSuffix, s.privateKey, &s.remoteAddr.pubKey)
 	if err != nil {
 		slog.Error("failed to prepare payload:",
 			"error", err)
 	}
-	s.OutPush(msg.PartID, fqdns...)
-
+	s.outLock.Lock()
+	s.outPacketBuffer = append(s.outPacketBuffer, fqdns...)
+	s.outLock.Unlock()
 	return len(b), nil
 }
 

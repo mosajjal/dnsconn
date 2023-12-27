@@ -5,7 +5,6 @@ import (
 	"compress/gzip"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"sort"
 	"strings"
@@ -25,8 +24,9 @@ const (
 	CompressionThreshold = 1024 * 2 // 2KB
 )
 
-// PartID is the ID of each part of a multipart message. ParentPartID is also of this type
+// PartID is the ID of each part of a multipart message.
 type PartID uint16
+type ConnID uint16
 
 type PacketMetaData uint8
 
@@ -99,7 +99,7 @@ const (
 type MessagePacket struct {
 	TimeStamp     uint32         `struc:"uint32,little"`
 	PartID        PartID         `struc:"uint16,little"`
-	ParentPartID  PartID         `struc:"uint16,little"`
+	ConnID        ConnID         `struc:"uint16,little"`
 	Metadata      PacketMetaData `struc:"uint8,little"`
 	PayloadLength uint8          `struc:"uint8,little,sizeof=Payload"`
 	Payload       []byte         `struc:"[]byte,little"`
@@ -181,10 +181,9 @@ func split(buf []byte, lim int) [][]byte {
 type FQDN string
 
 // PreparePartitionedPayload Gets a big payload that needs to be sent over the wire, chops it up into smaller limbs and creates a
-// list of messages to be sent. It also sends the parentPartID to make sure the series of messages are not lost
-func PreparePartitionedPayload(msg MessagePacket, payload []byte, dnsSuffix string, privateKey *cryptography.PrivateKey, serverPublicKey *cryptography.PublicKey) ([]FQDN, PartID, error) {
+// list of messages to be sent. It also sends the ConnID to make sure the series of messages are not lost
+func PreparePartitionedPayload(msgMetadata PacketMetaData, msgConnID ConnID, payload []byte, dnsSuffix string, privateKey *cryptography.PrivateKey, serverPublicKey *cryptography.PublicKey) ([]FQDN, ConnID, error) {
 	// TODO: fix duplicate sending
-
 	// handle compression
 	if len(payload) > CompressionThreshold {
 		var b bytes.Buffer
@@ -203,21 +202,20 @@ func PreparePartitionedPayload(msg MessagePacket, payload []byte, dnsSuffix stri
 
 	var err error
 	var response []FQDN
-	var parentPartID PartID = 0
+	msg := MessagePacket{
+		TimeStamp: uint32(time.Now().Unix()),
+		ConnID:    msgConnID,
+		Metadata:  msgMetadata,
+	}
 	msg.Metadata = msg.Metadata.SetIsLastPart(true) // if the message is only one part, the last part is always true
 	// retryCount := 1 //todo: retry of >1 could cause message duplicates
 	limbs := split(payload, int(ChunkSize))
 	if len(limbs) > 1 {
 		msg.Metadata = msg.Metadata.SetIsLastPart(false)
 		msg.PartID = 0
-		msg.ParentPartID = PartID(uint16(rand.Uint32()) + 1)
-		parentPartID = msg.ParentPartID
 	}
 	//todo: maybe a cap on the number of limbs here, as well as some progress logging inside the loop?
 	for i := 0; i < len(limbs); i++ {
-		// if retryCount == 0 {
-		// 	return response, parentPartID, errors.New("failed to send message after 10 attempts")
-		// }
 		if i == len(limbs)-1 && len(limbs) > 1 {
 			msg.Metadata = msg.Metadata.SetIsLastPart(true)
 		}
@@ -228,11 +226,12 @@ func PreparePartitionedPayload(msg MessagePacket, payload []byte, dnsSuffix stri
 		var buf bytes.Buffer
 		buf.Reset()
 		if err := struc.Pack(&buf, &msg); err != nil {
-			return response, parentPartID, err
+			return response, msg.ConnID, err
 		}
+		// fmt.Printf("sending: %#+v\n", msg) //todo: remove
 		encrypted, err := privateKey.Encrypt(serverPublicKey, buf.Bytes())
 		if err != nil {
-			return response, parentPartID, err
+			return response, msg.ConnID, err
 		}
 
 		s := cryptography.EncodeBytes(encrypted)
@@ -241,8 +240,7 @@ func PreparePartitionedPayload(msg MessagePacket, payload []byte, dnsSuffix stri
 		response = append(response, FQDN(fqdn+dnsSuffix))
 		msg.PartID++
 	}
-
-	return response, parentPartID, err
+	return response, msg.ConnID, err
 }
 
 // returns a list of subdomains from a dns message. if the msg type is answer, only answers are returned, otherwise only questions
@@ -322,6 +320,7 @@ func DecryptIncomingPacket(m *dns.Msg, suffix string, privatekey *cryptography.P
 			if err != nil {
 				return out, false, errors.New("couldn't unpack message")
 			}
+			// fmt.Printf("Decrypted: %#+v\n", o.Msg) //todo:remove
 			out = append(out, o)
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -14,7 +15,7 @@ import (
 )
 
 // implements net.Conn
-type client struct {
+type clientConn struct {
 	// transport related fields
 	privateKey      *cryptography.PrivateKey // private key of the client for decrypting and signing the messages
 	serverPublicKey *cryptography.PublicKey  // public key of the server for verifying the signature of the messages and encrypting the payload
@@ -24,11 +25,12 @@ type client struct {
 	// read related fields
 	timeout       time.Duration                                               // used in the startRead goroutine to make sure to close the connections that don't have a response from the server whatsoever
 	readInterval  time.Duration                                               // used in the startRead goroutine to configure the interval between sending read requests
-	readPacketBuf map[transport.PartID][]transport.MessagePacketWithSignature // buffer for incoming DNS packets so we can re-order and dedup before pushing to the actual bytes array
+	readPacketBuf map[transport.ConnID][]transport.MessagePacketWithSignature // buffer for incoming DNS packets so we can re-order and dedup before pushing to the actual bytes array
 	readBuf       []byte                                                      // raw bytes buffer. TODO: add max size
 	readCtx       context.Context                                             // used in Read function when setReadDeadline is used
 	readLock      sync.Mutex                                                  // used to lock the readBuf
 	connected     chan struct{}
+	connID        transport.ConnID
 
 	// write related fields
 	writeBuf  []byte          // outgoing buffer
@@ -37,9 +39,9 @@ type client struct {
 }
 
 // grabFullPayload tries to reconstruct the incoming buffer into a single payload. cleans the buffer if successful
-func (c *client) grabFullPayload(parentPartID transport.PartID) ([]byte, error) {
+func (c *clientConn) grabFullPayload(connID transport.ConnID) ([]byte, error) {
 	fullPayload := make([]byte, 0)
-	packets := transport.CheckMessageIntegrity(c.readPacketBuf[parentPartID])
+	packets := transport.CheckMessageIntegrity(c.readPacketBuf[connID])
 	if packets == nil {
 		// the payload does not have the last packet, we should return an empty payload and an error
 		return fullPayload, fmt.Errorf("the payload does not have the last packet yet")
@@ -48,14 +50,14 @@ func (c *client) grabFullPayload(parentPartID transport.PartID) ([]byte, error) 
 		packetPayload := packet.Msg.Payload[:]
 		fullPayload = append(fullPayload, packetPayload...)
 	}
-	delete(c.readPacketBuf, packets[0].Msg.ParentPartID)
+	delete(c.readPacketBuf, packets[0].Msg.ConnID)
 	// assuming this is the last part and we're going back to the normal interval
 	c.readInterval = 2 * time.Second
 	return bytes.Trim(fullPayload, "\x00"), nil
 
 }
 
-func (c *client) sendQuestionToServer(Q transport.FQDN) error {
+func (c *clientConn) sendQuestionToServer(Q transport.FQDN) error {
 	if len(Q) > 255 {
 		return fmt.Errorf("query is too big %d, can't send this", len(Q))
 	}
@@ -72,11 +74,10 @@ func (c *client) sendQuestionToServer(Q transport.FQDN) error {
 		// we will lower our interval to make sure we get all the data as fast as possible till we see the last part. then we'll revert
 		// back to the normal interval
 
-		parentPartID := transport.PartID(0)
 		// push the messages one by one to readPacketBuf based on their parent part id
 		for _, msg := range msgList {
-			if _, ok := c.readPacketBuf[msg.Msg.ParentPartID]; !ok {
-				c.readPacketBuf[msg.Msg.ParentPartID] = make([]transport.MessagePacketWithSignature, 0)
+			if _, ok := c.readPacketBuf[msg.Msg.ConnID]; !ok {
+				c.readPacketBuf[msg.Msg.ConnID] = make([]transport.MessagePacketWithSignature, 0)
 				c.readLock.Lock()
 			}
 
@@ -84,15 +85,12 @@ func (c *client) sendQuestionToServer(Q transport.FQDN) error {
 			// so we'll focus on only server to client packets that actuallly have useful data in the CNAME payload
 			if msgList[0].Msg.Metadata.IsServer2Client() {
 				c.readInterval = 50 * time.Millisecond // speed things up because tehre's a next message coming in
-				c.readPacketBuf[msg.Msg.ParentPartID] = append(c.readPacketBuf[msg.Msg.ParentPartID], msg)
-				if parentPartID == 0 {
-					parentPartID = msg.Msg.ParentPartID
-				}
+				c.readPacketBuf[msg.Msg.ConnID] = append(c.readPacketBuf[msg.Msg.ConnID], msg)
 			}
 
 			// if the packet from the server is the last part, we can start reconstructing the payload
 			if msg.Msg.Metadata.IsLastPart() {
-				if incomingPayload, err := c.grabFullPayload(parentPartID); err == nil {
+				if incomingPayload, err := c.grabFullPayload(msg.Msg.ConnID); err == nil {
 					c.readBuf = append(c.readBuf, incomingPayload...)
 					c.readLock.Unlock()
 				}
@@ -117,14 +115,14 @@ func DialDNST(privateKey *cryptography.PrivateKey, serverPublicKey *cryptography
 		privateKey, _ = cryptography.GenerateKey()
 	}
 
-	client := &client{
+	client := &clientConn{
 		timeout:         10 * time.Second,
 		privateKey:      privateKey,
 		serverPublicKey: serverPublicKey,
 		dnsSuffix:       DNSSuffix,
 		resolver:        resolver,
 	}
-	client.readPacketBuf = make(map[transport.PartID][]transport.MessagePacketWithSignature)
+	client.readPacketBuf = make(map[transport.ConnID][]transport.MessagePacketWithSignature)
 	client.readBuf = make([]byte, 0)
 	client.readCtx = context.Background()
 	client.readLock = sync.Mutex{}
@@ -134,6 +132,7 @@ func DialDNST(privateKey *cryptography.PrivateKey, serverPublicKey *cryptography
 	client.writeCtx = context.Background()
 	client.writeLock = sync.Mutex{}
 	client.connected = make(chan struct{}, 1)
+	client.connID = transport.ConnID(uint16(rand.Uint32()) + 1)
 
 	go client.startRead()
 	go client.startWrite()
@@ -144,18 +143,14 @@ func DialDNST(privateKey *cryptography.PrivateKey, serverPublicKey *cryptography
 }
 
 // startWrite is a goroutine that will continuously write the buffer to the server if it's not empty
-func (c *client) startWrite() {
+func (c *clientConn) startWrite() {
 	for {
 		select {
 		case <-c.writeCtx.Done():
-			msg := transport.MessagePacket{
-				TimeStamp: uint32(time.Now().Unix()),
-				Metadata:  transport.PacketMetaData(0),
-			}
-			msg.Metadata = msg.Metadata.SetIsClosing(true)
+			metadata := transport.PacketMetaData(0).SetIsClosing(true)
 			payload := []byte("closing!")
 			// we expect questions to be an array of one, since the payload is empty
-			questions, _, err := transport.PreparePartitionedPayload(msg, payload, c.dnsSuffix, c.privateKey, c.serverPublicKey)
+			questions, _, err := transport.PreparePartitionedPayload(metadata, c.connID, payload, c.dnsSuffix, c.privateKey, c.serverPublicKey)
 			if err != nil {
 				slog.Error("failed to prepare payload",
 					"error", err)
@@ -171,12 +166,9 @@ func (c *client) startWrite() {
 			c.writeLock.Lock()
 			if len(c.writeBuf) > 0 {
 				// write the buffer to the server and clear the buffer
-				msg := transport.MessagePacket{
-					TimeStamp: uint32(time.Now().Unix()),
-					Metadata:  transport.PacketMetaData(0),
-				}
-				msg.Metadata = msg.Metadata.SetIsClient2Server(true)
-				questions, _, err := transport.PreparePartitionedPayload(msg, c.writeBuf, c.dnsSuffix, c.privateKey, c.serverPublicKey)
+				metadata := transport.PacketMetaData(0).SetIsClient2Server(true)
+
+				questions, _, err := transport.PreparePartitionedPayload(metadata, c.connID, c.writeBuf, c.dnsSuffix, c.privateKey, c.serverPublicKey)
 				if err != nil {
 					slog.Error("failed to prepare payload",
 						"error", err)
@@ -198,7 +190,7 @@ func (c *client) startWrite() {
 
 // startRead starts a goroutine that sends healthchecks to the server. the server can send the payload as CNAME response to the healthchecks
 // if there's any data recieved, it'll be stored inside a buffer and will be passed on to the Read function as a FIFO
-func (c *client) startRead() {
+func (c *clientConn) startRead() {
 	ticker := time.NewTicker(c.readInterval)
 	defer ticker.Stop()
 	for {
@@ -206,15 +198,10 @@ func (c *client) startRead() {
 		case <-c.readCtx.Done():
 			return
 		case <-ticker.C:
-			msg := transport.MessagePacket{
-				TimeStamp: uint32(time.Now().Unix()),
-				Metadata:  transport.PacketMetaData(0),
-			}
-			msg.Metadata = msg.Metadata.SetIsKeepAlive(true)
-			msg.Metadata = msg.Metadata.SetIsServer2Client(true)
+			metadata := transport.PacketMetaData(0).SetIsServer2Client(true).SetIsKeepAlive(true)
 			payload := []byte("ping!")
 			// we expect questions to be an array of one, since the payload is empty
-			questions, _, err := transport.PreparePartitionedPayload(msg, payload, c.dnsSuffix, c.privateKey, c.serverPublicKey)
+			questions, _, err := transport.PreparePartitionedPayload(metadata, c.connID, payload, c.dnsSuffix, c.privateKey, c.serverPublicKey)
 			if err != nil {
 				slog.Error("failed to prepare payload",
 					"error", err)
@@ -231,7 +218,7 @@ func (c *client) startRead() {
 }
 
 // ReadFrom checks the buffer and returns everything inside it. the buffer is then flushed
-func (c *client) Read(b []byte) (n int, err error) {
+func (c *clientConn) Read(b []byte) (n int, err error) {
 	c.readLock.Lock()
 	defer c.readLock.Unlock()
 	n = copy(b, c.readBuf)
@@ -242,7 +229,7 @@ func (c *client) Read(b []byte) (n int, err error) {
 
 // WriteTo sends the payload to the server as series of DNS A queries
 // addr is ignored and is always replaced by the server's public key
-func (c *client) Write(b []byte) (n int, err error) {
+func (c *clientConn) Write(b []byte) (n int, err error) {
 	c.writeLock.Lock()
 	defer c.writeLock.Unlock()
 	c.writeBuf = append(c.writeBuf, b...)
@@ -250,35 +237,35 @@ func (c *client) Write(b []byte) (n int, err error) {
 }
 
 // Close cleans up the connection by sending a IsClosing payload. TODO: implement
-func (c *client) Close() error {
+func (c *clientConn) Close() error {
 	c.writeCtx.Done()
 	c.readCtx.Done()
 	return nil
 }
 
 // LocalAddr returns the local network address
-func (c *client) LocalAddr() net.Addr {
+func (c *clientConn) LocalAddr() net.Addr {
 	return &DNSTAddr{pubKey: c.privateKey.GetPublicKey()}
 }
 
-func (c *client) RemoteAddr() net.Addr {
+func (c *clientConn) RemoteAddr() net.Addr {
 	return &DNSTAddr{pubKey: *c.serverPublicKey}
 }
 
-func (c *client) SetDeadline(t time.Time) error {
+func (c *clientConn) SetDeadline(t time.Time) error {
 	c.SetReadDeadline(t)
 	c.SetWriteDeadline(t)
 	return nil
 }
 
-func (c *client) SetReadDeadline(t time.Time) error {
+func (c *clientConn) SetReadDeadline(t time.Time) error {
 	var cancel context.CancelFunc
 	c.readCtx, cancel = context.WithDeadline(c.readCtx, t)
 	defer cancel()
 	return nil
 }
 
-func (c *client) SetWriteDeadline(t time.Time) error {
+func (c *clientConn) SetWriteDeadline(t time.Time) error {
 	var cancel context.CancelFunc
 	c.writeCtx, cancel = context.WithDeadline(c.writeCtx, t)
 	defer cancel()
