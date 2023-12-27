@@ -3,10 +3,8 @@ module github.com/mosajjal/dnsconn
 go 1.21.5
 
 require (
-	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/lunixbochs/struc v0.0.0-20200707160740-784aaebc1d40
 	github.com/miekg/dns v1.1.57
-	github.com/things-go/go-socks5 v0.0.4
 )
 
 require (
