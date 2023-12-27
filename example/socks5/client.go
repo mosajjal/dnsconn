@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bufio"
-	"fmt"
 	"net"
-	"os"
 
 	"github.com/mosajjal/dnsconn"
 	"github.com/mosajjal/dnsconn/cryptography"
+	"github.com/things-go/go-socks5"
 )
 
 func main() {
@@ -19,21 +17,10 @@ func main() {
 	dnstConn := dnsconn.DialDNST(privateKey, serverPubcliKey, ".example.com.", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5300})
 	defer dnstConn.Close()
 
-	// Send a message to the server
-	_, err := dnstConn.Write([]byte("Hello TCP Server\n"))
-	if err != nil {
-		fmt.Printf("Error: %s\n", err)
-		os.Exit(1)
-	}
+	sf := socks5.NewServer()
 
-	// Read from the connection untill a new line is send
-	data, err := bufio.NewReader(dnstConn).ReadString('\n')
-	if err != nil {
-		fmt.Printf("Error2: %s\n", err)
-		return
-	}
+	sf.Proxy(dnstConn)
 
-	// Print the data read from the connection to the terminal
-	fmt.Print("> ", string(data))
+	sf.ListenAndServe("tcp", ":1080")
 
 }
