@@ -8,6 +8,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lunixbochs/struc"
@@ -114,14 +115,18 @@ type MessagePacketWithSignature struct {
 // since the comms channel for DNS is out of our hands, we need to implement a dedup method for any bytestream
 type dedup map[uint64]struct{}
 
+var dedupRWLock = &sync.RWMutex{}
+
 // Add function gets a byte array and adds it to the dedup table. returns true if the key is new, false if it already exists
 func (d *dedup) Add(keyBytes []byte) bool {
 	//calculate FNV1A
+	dedupRWLock.Lock()
 	key := FNV1A(keyBytes)
 	if _, ok := (*d)[key]; ok {
 		return false
 	}
 	(*d)[key] = struct{}{}
+	dedupRWLock.Unlock()
 	return true
 }
 

@@ -184,8 +184,13 @@ func (s *Server) handleServerToClient(w dns.ResponseWriter, r *dns.Msg, emptyPay
 	} else {
 		// pop the first item from the out buffer
 		client.outLock.Lock()
-		fqdn = client.outPacketBuffer[0]
-		client.outPacketBuffer = client.outPacketBuffer[1:]
+		if len(client.outPacketBuffer) == 0 {
+			// if we have nothing to send to the client, we'll respond with a healthcheck
+			fqdn = client.prepareEncryptedPong()
+		} else {
+			fqdn = client.outPacketBuffer[0]
+			client.outPacketBuffer = client.outPacketBuffer[1:]
+		}
 		client.outLock.Unlock()
 	}
 	cname, err := dns.NewRR(fmt.Sprintf("%s CNAME %s", r.Question[0].Name, fqdn))

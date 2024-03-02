@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
 	"github.com/mosajjal/dnsconn"
 	"github.com/mosajjal/dnsconn/cryptography"
@@ -56,4 +57,5 @@ func main() {
 
 	// Print the data read from the connection to the terminal
 	fmt.Print("> ", string(data))
+	time.Sleep(10 * time.Second)
 }
