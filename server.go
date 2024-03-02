@@ -50,7 +50,7 @@ type clientStatus struct {
 type ClientKeyConnID string
 
 func (s *Server) deriveClientKeyConnID(payload *transport.MessagePacketWithSignature) ClientKeyConnID {
-	return ClientKeyConnID(string(payload.Signature.String()) + string(payload.Msg.ConnID))
+	return ClientKeyConnID(string(payload.Signature.String()) + fmt.Sprint(payload.Msg.ConnID))
 }
 
 // implements net.Listener
