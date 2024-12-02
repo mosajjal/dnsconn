@@ -2,12 +2,15 @@ package main
 
 import (
 	"bufio"
-	"fmt"
+	"log/slog"
 	"net"
+	"os"
 
 	"github.com/mosajjal/dnsconn"
 	"github.com/mosajjal/dnsconn/cryptography"
 )
+
+var log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{}))
 
 func main() {
 
@@ -20,14 +23,23 @@ func main() {
 	// start listening on udp5300
 	pc, err := net.ListenPacket("udp", ":5300")
 	if err != nil {
-		panic(err)
+		log.Error("error listening on udp",
+			"msg", err)
+		os.Exit(1)
 	}
 	defer pc.Close()
 
 	// TODO: this can have a client handler function that will be called when a new client connects. each function will be run out of a separate goroutine
-	dnstListener, err := dnsconn.ListenDNST(privateKey, pc, ".example.com.", nil)
+	// dnstListener, err := dnsconn.ListenDNST(privateKey, pc, ".example.com.", nil)
+	dnstListener, err := dnsconn.ListenDNST(
+		dnsconn.WithServerPrivateKey(privateKey),
+		dnsconn.WithListener(pc),
+		dnsconn.WithServerDNSSuffix(".example.com."),
+	)
 	if err != nil {
-		panic(err)
+		log.Error("error listening on dns",
+			"msg", err)
+		os.Exit(1)
 	}
 
 	defer dnstListener.Close()
@@ -36,7 +48,9 @@ func main() {
 		// Accept new connections
 		conn, err := dnstListener.Accept()
 		if err != nil {
-			fmt.Println(err)
+			log.Warn("error accepting connection",
+				"msg", err)
+			continue
 		}
 		// Handle new connections in a Goroutine for concurrency
 		go handleConnection(conn)
@@ -50,13 +64,17 @@ func handleConnection(conn net.Conn) {
 	// Read from the connection untill a new line is send
 	data, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
-		fmt.Printf("error2: %s\n", err)
+		log.Warn("error reading from connection",
+			"msg", err)
 		return
 	}
 
 	// Print the data read from the connection to the terminal
-	fmt.Print("> ", string(data))
+	log.Info("message received",
+		"msg", string(data))
 
+	log.Debug("sending message back",
+		"msg", "Hello TCP Client")
 	// Write back the same message to the client
 	conn.Write([]byte("Hello TCP Client\n"))
 

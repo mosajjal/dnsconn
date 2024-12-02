@@ -18,10 +18,12 @@ const (
 	defaultCleanupInterval = time.Minute
 )
 
+// DNSTAddr is a net.Addr implementation for DNS Tunnel
 type DNSTAddr struct {
 	pubKey cryptography.PublicKey
 }
 
+// Network returns the network type
 func (a *DNSTAddr) Network() string {
 	return "dnsconn"
 }
@@ -53,7 +55,7 @@ func (s *Server) deriveClientKeyConnID(payload *transport.MessagePacketWithSigna
 	return ClientKeyConnID(string(payload.Signature.String()) + fmt.Sprint(payload.Msg.ConnID))
 }
 
-// implements net.Listener
+// Server implements net.Listener
 type Server struct {
 	Listener           net.PacketConn // DNS Tunnel works on top of a dns server (udp, tcp, tls, unix socket etc). The design is decoupled from the nature of the socket
 	DNSSuffix          string         // top level suffix expected
@@ -67,29 +69,87 @@ type Server struct {
 	ctx              context.Context
 }
 
-// ListenDNST creates a new DNS Tunnel server. It will return a net.PacketConn that can be used to send and receive any arbitrary payload
-// parameters:
-//   - privateKey: the private key of the agent. can be empty. in which case, a new private key will be generated on the fly
-//   - listener: the underlying packet listener used for dns tunneling. cannot be nil
-//   - dnsSuffix: the DNS suffix of the server. cannot be empty and MUST have a trailing and leading dot
-//   - acceptedClientKeys: if not empty, only comms from these keys will be accepted
-func ListenDNST(privateKey *cryptography.PrivateKey, listener net.PacketConn, dnsSuffix string, acceptedClientKeys ...*cryptography.PublicKey) (net.Listener, error) {
-	if privateKey == nil {
-		// generate a new private key
-		privateKey, _ = cryptography.GenerateKey()
+// ServerOption defines the type for functional options
+type ServerOption func(*serverConfig)
+
+// serverConfig holds all configurable options
+type serverConfig struct {
+	privateKey         *cryptography.PrivateKey
+	listener           net.PacketConn
+	dnsSuffix          string
+	acceptedClientKeys []*cryptography.PublicKey
+	cleanupInterval    time.Duration
+}
+
+// WithServerPrivateKey sets the server's private key
+func WithServerPrivateKey(key *cryptography.PrivateKey) ServerOption {
+	return func(c *serverConfig) {
+		c.privateKey = key
 	}
-	if listener == nil {
+}
+
+// WithListener sets the DNS packet listener
+func WithListener(listener net.PacketConn) ServerOption {
+	return func(c *serverConfig) {
+		c.listener = listener
+	}
+}
+
+// WithServerDNSSuffix sets the DNS suffix
+func WithServerDNSSuffix(suffix string) ServerOption {
+	return func(c *serverConfig) {
+		c.dnsSuffix = suffix
+	}
+}
+
+// WithAcceptedClientKeys sets the allowed client public keys
+func WithAcceptedClientKeys(keys ...*cryptography.PublicKey) ServerOption {
+	return func(c *serverConfig) {
+		c.acceptedClientKeys = keys
+	}
+}
+
+// WithCleanupInterval sets the interval for cleaning up idle clients
+func WithCleanupInterval(interval time.Duration) ServerOption {
+	return func(c *serverConfig) {
+		c.cleanupInterval = interval
+	}
+}
+
+// ListenDNST creates a new DNS Tunnel server using functional options
+func ListenDNST(opts ...ServerOption) (net.Listener, error) {
+	// Default configuration
+	cfg := &serverConfig{
+		cleanupInterval: defaultCleanupInterval,
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	// Validate required fields
+	if cfg.listener == nil {
 		return nil, errors.New("listener cannot be nil")
 	}
-	if dnsSuffix == "" {
+	if cfg.dnsSuffix == "" {
 		return nil, errors.New("dns suffix cannot be empty")
 	}
 
+	// Generate private key if not provided
+	if cfg.privateKey == nil {
+		var err error
+		cfg.privateKey, err = cryptography.GenerateKey()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate private key: %w", err)
+		}
+	}
+
 	server := &Server{
-		Listener:           listener,
-		DNSSuffix:          dnsSuffix,
-		privateKey:         privateKey,
-		acceptedClientKeys: acceptedClientKeys,
+		Listener:           cfg.listener,
+		DNSSuffix:          cfg.dnsSuffix,
+		privateKey:         cfg.privateKey,
+		acceptedClientKeys: cfg.acceptedClientKeys,
 		clients:            make(map[ClientKeyConnID]*clientStatus),
 		clientLock:         sync.Mutex{},
 		latestClient:       make(chan *clientStatus, 1),
@@ -100,10 +160,12 @@ func ListenDNST(privateKey *cryptography.PrivateKey, listener net.PacketConn, dn
 	dns.HandleFunc(".", server.handleDNS)
 
 	dnsServer := dns.Server{
-		PacketConn: listener,
+		PacketConn: cfg.listener,
 	}
+
 	go dnsServer.ActivateAndServe()
 	go server.cleanupDeadClients()
+
 	return server, nil
 }
 

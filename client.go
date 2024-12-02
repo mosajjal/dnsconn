@@ -103,30 +103,105 @@ func (c *clientConn) sendQuestionToServer(Q transport.FQDN) error {
 	return nil
 }
 
-// DialDNST creates a new DNS Tunnel client. It will return a net.PacketConn that can be used to send and receive any arbitrary payload
-// parameters:
-//   - privateKey: the private key of the agent. can be empty. in which case, a new private key will be generated on the fly
-//   - serverPublicKey: the public key of the server. cannot be empty
-//   - DNSSuffix: the DNS suffix of the server. cannot be empty and MUST have a trailing and leading dot
-//   - resolver: the address of the DNS server to send the queries to. can be nil in which case OS's default resolver will be used
-func DialDNST(privateKey *cryptography.PrivateKey, serverPublicKey *cryptography.PublicKey, DNSSuffix string, resolver net.Addr) net.Conn {
-	if privateKey == nil {
-		// generate a new private key
-		privateKey, _ = cryptography.GenerateKey()
+// ClientOption defines the type for functional options
+type ClientOption func(*clientConfig)
+
+// clientConfig holds all configurable options
+type clientConfig struct {
+	privateKey      *cryptography.PrivateKey
+	serverPublicKey *cryptography.PublicKey
+	dnsSuffix       string
+	resolver        net.Addr
+	timeout         time.Duration
+	readInterval    time.Duration
+}
+
+// WithPrivateKey sets the private key
+func WithPrivateKey(key *cryptography.PrivateKey) ClientOption {
+	return func(c *clientConfig) {
+		c.privateKey = key
+	}
+}
+
+// WithServerPublicKey sets the server public key
+func WithServerPublicKey(key *cryptography.PublicKey) ClientOption {
+	return func(c *clientConfig) {
+		c.serverPublicKey = key
+	}
+}
+
+// WithDNSSuffix sets the DNS suffix
+func WithDNSSuffix(suffix string) ClientOption {
+	return func(c *clientConfig) {
+		c.dnsSuffix = suffix
+	}
+}
+
+// WithResolver sets the DNS resolver
+func WithResolver(resolver net.Addr) ClientOption {
+	return func(c *clientConfig) {
+		c.resolver = resolver
+	}
+}
+
+// WithTimeout sets the connection timeout
+func WithTimeout(timeout time.Duration) ClientOption {
+	return func(c *clientConfig) {
+		c.timeout = timeout
+	}
+}
+
+// WithReadInterval sets the read polling interval
+func WithReadInterval(interval time.Duration) ClientOption {
+	return func(c *clientConfig) {
+		c.readInterval = interval
+	}
+}
+
+// DialDNST creates a new DNS Tunnel client using functional options
+func DialDNST(opts ...ClientOption) (net.Conn, error) {
+	// Default configuration
+	cfg := &clientConfig{
+		timeout:      10 * time.Second,
+		readInterval: time.Second,
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	// Validate required fields
+	if cfg.serverPublicKey == nil {
+		return nil, fmt.Errorf("server public key is required")
+	}
+	if cfg.dnsSuffix == "" {
+		return nil, fmt.Errorf("DNS suffix is required")
+	}
+
+	// Generate private key if not provided
+	if cfg.privateKey == nil {
+		var err error
+		cfg.privateKey, err = cryptography.GenerateKey()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate private key: %w", err)
+		}
 	}
 
 	client := &clientConn{
-		timeout:         10 * time.Second,
-		privateKey:      privateKey,
-		serverPublicKey: serverPublicKey,
-		dnsSuffix:       DNSSuffix,
-		resolver:        resolver,
+		timeout:         cfg.timeout,
+		privateKey:      cfg.privateKey,
+		serverPublicKey: cfg.serverPublicKey,
+		dnsSuffix:       cfg.dnsSuffix,
+		resolver:        cfg.resolver,
 	}
+
+	// Initialize remaining fields
 	client.readPacketBuf = make(map[transport.ConnID][]transport.MessagePacketWithSignature)
 	client.readBuf = make([]byte, 0)
 	client.readCtx = context.Background()
 	client.readLock = sync.Mutex{}
-	client.readInterval = 1 * time.Second
+	client.readInterval = cfg.readInterval
 
 	client.writeBuf = make([]byte, 0)
 	client.writeCtx = context.Background()
@@ -136,10 +211,9 @@ func DialDNST(privateKey *cryptography.PrivateKey, serverPublicKey *cryptography
 
 	go client.startRead()
 	go client.startWrite()
-	// BUG: client won't want and just quits on this
-	<-client.connected
-	return client
 
+	<-client.connected
+	return client, nil
 }
 
 // startWrite is a goroutine that will continuously write the buffer to the server if it's not empty
