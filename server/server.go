@@ -1,4 +1,4 @@
-package dnsconn
+package server
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -18,20 +19,6 @@ const (
 	defaultCleanupInterval = time.Minute
 )
 
-// DNSTAddr is a net.Addr implementation for DNS Tunnel
-type DNSTAddr struct {
-	pubKey cryptography.PublicKey
-}
-
-// Network returns the network type
-func (a *DNSTAddr) Network() string {
-	return "dnsconn"
-}
-
-func (a *DNSTAddr) String() string {
-	return string(a.pubKey.String())
-}
-
 // implements net.Conn
 type clientStatus struct {
 	ConnID                     transport.ConnID
@@ -43,8 +30,9 @@ type clientStatus struct {
 	outPacketBuffer            []transport.FQDN
 
 	privateKey *cryptography.PrivateKey
-	remoteAddr DNSTAddr
+	remoteAddr transport.DNSTAddr
 	DNSSuffix  string
+	logger     *slog.Logger
 }
 
 // ClientKeyConnID is a string composite type that's built with the client's public key string + the connection ID
@@ -67,6 +55,7 @@ type Server struct {
 	// dedupPrevMsgHash is only for consecutive message duplicates
 	dedupPrevMsgHash uint64 // since dns servers send multiple queries at the same time, simple dedup helps
 	ctx              context.Context
+	logger           *slog.Logger
 }
 
 // ServerOption defines the type for functional options
@@ -79,6 +68,7 @@ type serverConfig struct {
 	dnsSuffix          string
 	acceptedClientKeys []*cryptography.PublicKey
 	cleanupInterval    time.Duration
+	logger             *slog.Logger
 }
 
 // WithServerPrivateKey sets the server's private key
@@ -116,6 +106,13 @@ func WithCleanupInterval(interval time.Duration) ServerOption {
 	}
 }
 
+// WithLogger sets the logger
+func WithLogger(logger *slog.Logger) ServerOption {
+	return func(c *serverConfig) {
+		c.logger = logger
+	}
+}
+
 // ListenDNST creates a new DNS Tunnel server using functional options
 func ListenDNST(opts ...ServerOption) (net.Listener, error) {
 	// Default configuration
@@ -134,6 +131,9 @@ func ListenDNST(opts ...ServerOption) (net.Listener, error) {
 	}
 	if cfg.dnsSuffix == "" {
 		return nil, errors.New("dns suffix cannot be empty")
+	}
+	if cfg.logger == nil {
+		cfg.logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{}))
 	}
 
 	// Generate private key if not provided
@@ -155,6 +155,7 @@ func ListenDNST(opts ...ServerOption) (net.Listener, error) {
 		latestClient:       make(chan *clientStatus, 1),
 		dedupPrevMsgHash:   0,
 		ctx:                context.Background(),
+		logger:             cfg.logger,
 	}
 
 	dns.HandleFunc(".", server.handleDNS)
@@ -179,7 +180,7 @@ func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 	case dns.OpcodeQuery:
 		payloads, skip, err := transport.DecryptIncomingPacket(m, s.DNSSuffix, s.privateKey, nil)
 		if skip || err != nil {
-			slog.Warn("failed to decrypt incoming packet",
+			s.logger.Warn("failed to decrypt incoming packet",
 				"error", err)
 			return
 		}
@@ -212,8 +213,9 @@ func (s *Server) initiateNewClient(payload *transport.MessagePacketWithSignature
 		outPacketBuffer:            make([]transport.FQDN, 0),
 
 		privateKey: s.privateKey,
-		remoteAddr: DNSTAddr{pubKey: *payload.Signature},
+		remoteAddr: transport.NewDNSTAddr(*payload.Signature),
 		DNSSuffix:  s.DNSSuffix,
+		logger:     s.logger,
 	}
 	s.clientLock.Unlock()
 	return s.clients[k]
@@ -221,11 +223,11 @@ func (s *Server) initiateNewClient(payload *transport.MessagePacketWithSignature
 
 // prepareEncryptedPong prepares a pong! message for the client
 func (s *clientStatus) prepareEncryptedPong() transport.FQDN {
-	metadata := transport.PacketMetaData(0).SetIsLastPart(true).SetIsClosing(true)
+	metadata := transport.PacketMetaData(transport.NoMetadata).SetIsLastPart(true).SetIsClosing(true)
 
-	cnames, _, err := transport.PreparePartitionedPayload(metadata, s.ConnID, []byte("pong!"), s.DNSSuffix, s.privateKey, &s.remoteAddr.pubKey)
+	cnames, _, err := transport.PreparePartitionedPayload(metadata, s.ConnID, []byte("pong!"), s.DNSSuffix, s.privateKey, s.remoteAddr.PublicKey())
 	if err != nil {
-		slog.Error("failed to prepare payload",
+		s.logger.Error("failed to prepare payload",
 			"error", err)
 	}
 	return cnames[0]
@@ -257,12 +259,12 @@ func (s *Server) handleServerToClient(w dns.ResponseWriter, r *dns.Msg, emptyPay
 	}
 	cname, err := dns.NewRR(fmt.Sprintf("%s CNAME %s", r.Question[0].Name, fqdn))
 	if err != nil {
-		slog.Error("failed to create CNAME",
+		s.logger.Error("failed to create CNAME",
 			"error", err)
 	}
 	r.Answer = append(r.Answer, cname)
 	if err := w.WriteMsg(r); err != nil {
-		slog.Warn("failed to write response",
+		s.logger.Warn("failed to write response",
 			"error", err)
 	}
 }
@@ -274,7 +276,7 @@ func (s *Server) handleClientToServer(w dns.ResponseWriter, r *dns.Msg, payload 
 	if client, ok := s.clients[k]; !ok {
 		// since any "normal" client starts by sending a healthcheck, they should be already reigstered on the handleServer2Client function
 		// and this should be a very rare case
-		slog.Warn("client is sending a payload before sending a healthcheck")
+		s.logger.Warn("client is sending a payload before sending a healthcheck")
 		client = s.initiateNewClient(&payload)
 		s.latestClient <- client
 	} else {
@@ -284,29 +286,30 @@ func (s *Server) handleClientToServer(w dns.ResponseWriter, r *dns.Msg, payload 
 			packets := transport.CheckMessageIntegrity(client.inPacketBuffer)
 			if packets == nil {
 				// the payload does not have the last packet, we should return an empty payload and an error
-				slog.Warn("failed to check message integrity")
+				s.logger.Warn("failed to check message integrity")
 			}
 			for _, packet := range packets {
 				packetPayload := packet.Msg.Payload[:]
 				client.inBuffer <- packetPayload
 			}
+			// clear the buffer
 			client.inPacketBuffer = make([]transport.MessagePacketWithSignature, 0)
 		}
 	}
 
-	cnames, _, err := transport.PreparePartitionedPayload(transport.PacketMetaData(0), payload.Msg.ConnID, []byte("pong!"), s.DNSSuffix, s.privateKey, payload.Signature)
+	cnames, _, err := transport.PreparePartitionedPayload(transport.PacketMetaData(transport.IsServer2Client), payload.Msg.ConnID, []byte("pong!"), s.DNSSuffix, s.privateKey, payload.Signature)
 	if err != nil {
-		slog.Error("failed to prepare payload",
+		s.logger.Error("failed to prepare payload",
 			"error", err)
 	}
 	cname, err := dns.NewRR(fmt.Sprintf("%s CNAME %s", r.Question[0].Name, cnames[0]))
 	if err != nil {
-		slog.Error("failed to create CNAME",
+		s.logger.Error("failed to create CNAME",
 			"error", err)
 	}
 	r.Answer = append(r.Answer, cname)
 	if err := w.WriteMsg(r); err != nil {
-		slog.Warn("failed to write response",
+		s.logger.Warn("failed to write response",
 			"error", err)
 	}
 
@@ -318,7 +321,7 @@ func (s *Server) handleClosing(w dns.ResponseWriter, r *dns.Msg, payload transpo
 	k := s.deriveClientKeyConnID(&payload)
 	client, ok := s.clients[k]
 	if !ok {
-		slog.Warn("client is sending a closing packet but they don't exist anyway")
+		s.logger.Warn("client is sending a closing packet but they don't exist anyway")
 		return
 	}
 	// delete the client item
@@ -343,13 +346,12 @@ func (s *Server) cleanupDeadClients() {
 }
 
 func (s *Server) Close() error {
+	s.Listener.Close()
 	return nil
 }
 
 func (s *Server) Addr() net.Addr {
-	return &DNSTAddr{
-		pubKey: s.privateKey.GetPublicKey(),
-	}
+	return transport.NewDNSTAddr(s.privateKey.GetPublicKey())
 }
 
 func (s *Server) Accept() (net.Conn, error) {
@@ -365,11 +367,11 @@ func (s *clientStatus) Read(b []byte) (n int, err error) {
 
 func (s *clientStatus) Write(b []byte) (n int, err error) {
 
-	metadata := transport.PacketMetaData(0).SetIsServer2Client(true)
+	metadata := transport.PacketMetaData(transport.NoMetadata).SetIsServer2Client(true)
 
-	fqdns, _, err := transport.PreparePartitionedPayload(metadata, s.ConnID, b, s.DNSSuffix, s.privateKey, &s.remoteAddr.pubKey)
+	fqdns, _, err := transport.PreparePartitionedPayload(metadata, s.ConnID, b, s.DNSSuffix, s.privateKey, s.remoteAddr.PublicKey())
 	if err != nil {
-		slog.Error("failed to prepare payload:",
+		s.logger.Error("failed to prepare payload:",
 			"error", err)
 	}
 	s.outLock.Lock()
@@ -382,7 +384,7 @@ func (s *clientStatus) Close() error {
 	return nil
 }
 func (s *clientStatus) LocalAddr() net.Addr {
-	return &DNSTAddr{pubKey: s.privateKey.GetPublicKey()}
+	return transport.NewDNSTAddr(s.privateKey.GetPublicKey())
 }
 func (s *clientStatus) RemoteAddr() net.Addr {
 	return &s.remoteAddr

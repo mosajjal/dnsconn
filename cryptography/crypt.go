@@ -18,11 +18,19 @@ type PublicKey struct {
 }
 type PublicKeyStr string
 
+func (k PublicKeyStr) String() string {
+	return string(k)
+}
+
 // PrivateKey is a bytestream of data not converted to anything
 type PrivateKey struct {
 	D []byte
 }
 type PrivateKeyStr string
+
+func (k PrivateKeyStr) String() string {
+	return string(k)
+}
 
 var algorithm = elliptic.P256()
 
@@ -92,6 +100,60 @@ func (private *PrivateKey) Decrypt(data []byte) (decrypted []byte, err error) {
 	buf := bytes.Buffer{}
 	x, y := elliptic.UnmarshalCompressed(algorithm, data[0:33])
 	if x == nil || y == nil {
+		err = errors.New("invalid public key")
+		return
+	}
+
+	sym, _ := algorithm.ScalarMult(x, y, private.D)
+	_, err = buf.Write(sym.Bytes())
+	if err != nil {
+		return
+	}
+	_, err = buf.Write([]byte{0x00, 0x00, 0x00, 0x01})
+	if err != nil {
+		return
+	}
+	_, err = buf.Write(data[0:33])
+	if err != nil {
+		return
+	}
+	hashed := sha256.Sum256(buf.Bytes())
+	buf.Reset()
+
+	block, err := aes.NewCipher(hashed[0:16])
+	if err != nil {
+		return
+	}
+	ch, err := cipher.NewGCMWithNonceSize(block, 16)
+	if err != nil {
+		return
+	}
+	decrypted, err = ch.Open(nil, hashed[16:], data[33:], nil)
+	return
+}
+
+// DecryptAndVerify will provide a decryption mechanism for an arbitrary bytestream
+// it also uses the publicKey to verify the sender
+func (private *PrivateKey) DecryptAndVerify(data []byte, publicKey *PublicKey) (decrypted []byte, err error) {
+	// with variable length, this is meaningless. however, DNS servers sometimes
+	// send a subdomain of our request to the server rather than the full query
+	// so some checks need to be in place
+	if len(data) < 34 {
+		err = errors.New("invalid data size")
+		return
+	}
+	if private == nil {
+		err = errors.New("invalid private key")
+		return
+	}
+	buf := bytes.Buffer{}
+	x, y := elliptic.UnmarshalCompressed(algorithm, data[0:33])
+	if x == nil || y == nil {
+		err = errors.New("invalid public key")
+		return
+	}
+	// verify x,y against the public key
+	if x.Cmp(publicKey.X) != 0 || y.Cmp(publicKey.Y) != 0 {
 		err = errors.New("invalid public key")
 		return
 	}

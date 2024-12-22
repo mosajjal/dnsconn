@@ -31,6 +31,9 @@ type ConnID uint16
 
 type PacketMetaData uint8
 
+// FQDN would be the actual A query or CNAME response that is sent over the wire
+type FQDN string
+
 func (p PacketMetaData) IsClient2Server() bool {
 	return p&IsClient2Server == IsClient2Server
 }
@@ -89,6 +92,7 @@ func (p PacketMetaData) SetIsClosing(isClosing bool) PacketMetaData {
 }
 
 const (
+	NoMetadata      PacketMetaData = 0
 	IsClient2Server PacketMetaData = 1 << 0
 	IsServer2Client PacketMetaData = 1 << 1
 	IsLastPart      PacketMetaData = 1 << 2
@@ -96,7 +100,8 @@ const (
 	IsClosing       PacketMetaData = 1 << 4
 )
 
-// MessagePacket is the payload that will be on the wire for each DNS query and response
+// MessagePacket is the payload that gets (optionally) compressed, encrypted and the resulting payload
+// will be on the wire for each DNS query and response
 type MessagePacket struct {
 	TimeStamp     uint32         `struc:"uint32,little"`
 	PartID        PartID         `struc:"uint16,little"`
@@ -151,6 +156,7 @@ func PerformExternalAQuery(Q FQDN, server net.Addr) (*dns.Msg, error) {
 
 // inserNth takes a string and inserts a dot char every nth char.
 // returns the number of dots inserted, plus the modified string
+// example: insertNth("1234567890", 3) => "123.456.789.0.3"
 func insertNth(s string, n int) string {
 	var buffer bytes.Buffer
 	numberOfDots := 0
@@ -183,29 +189,34 @@ func split(buf []byte, lim int) [][]byte {
 	return chunks
 }
 
-type FQDN string
+func mustGZIP(in []byte) []byte {
+	var b bytes.Buffer
+	gz, _ := gzip.NewWriterLevel(&b, gzip.BestCompression)
+	if _, err := gz.Write(in); err != nil {
+		return nil
+	}
+	if err := gz.Flush(); err != nil {
+		return nil
+	}
+	if err := gz.Close(); err != nil {
+		return nil
+	}
+	return b.Bytes()
+}
 
-// PreparePartitionedPayload Gets a big payload that needs to be sent over the wire, chops it up into smaller limbs and creates a
-// list of messages to be sent. It also sends the ConnID to make sure the series of messages are not lost
+// PreparePartitionedPayload Gets a payload with arbitrary length that needs to be sent over the wire.
+// based on the const config items, it will split the payload to smaller parts and creates a
+// list of FQDNs to be sent over the wire. It also returns the ConnID to make sure the series of messages are not lost
 func PreparePartitionedPayload(msgMetadata PacketMetaData, msgConnID ConnID, payload []byte, dnsSuffix string, privateKey *cryptography.PrivateKey, serverPublicKey *cryptography.PublicKey) ([]FQDN, ConnID, error) {
 	// TODO: fix duplicate sending
 	// handle compression
 	if len(payload) > CompressionThreshold {
-		var b bytes.Buffer
-		gz, _ := gzip.NewWriterLevel(&b, gzip.BestCompression)
-		if _, err := gz.Write(payload); err != nil {
-			return nil, 0, err
+		payload = mustGZIP(payload)
+		if payload == nil {
+			return nil, msgConnID, errors.New("failed to compress payload")
 		}
-		if err := gz.Flush(); err != nil {
-			return nil, 0, err
-		}
-		if err := gz.Close(); err != nil {
-			return nil, 0, err
-		}
-		payload = b.Bytes()
 	}
 
-	var err error
 	var response []FQDN
 	msg := MessagePacket{
 		TimeStamp: uint32(time.Now().Unix()),
@@ -214,20 +225,22 @@ func PreparePartitionedPayload(msgMetadata PacketMetaData, msgConnID ConnID, pay
 	}
 	msg.Metadata = msg.Metadata.SetIsLastPart(true) // if the message is only one part, the last part is always true
 	// retryCount := 1 //todo: retry of >1 could cause message duplicates
-	limbs := split(payload, int(ChunkSize))
-	if len(limbs) > 1 {
+	msgParts := split(payload, int(ChunkSize))
+	if len(msgParts) > 1 {
+		// if the message is more than one part, the first part is never the last part
 		msg.Metadata = msg.Metadata.SetIsLastPart(false)
 		msg.PartID = 0
 	}
 	//todo: maybe a cap on the number of limbs here, as well as some progress logging inside the loop?
-	for i := 0; i < len(limbs); i++ {
-		if i == len(limbs)-1 && len(limbs) > 1 {
+	// looping over the msgparts, encrypting the payload and creating the FQDN
+	for i := 0; i < len(msgParts); i++ {
+		if i == len(msgParts)-1 && len(msgParts) > 1 {
 			msg.Metadata = msg.Metadata.SetIsLastPart(true)
 		}
 		// msg.Payload = []byte{}
 		// msg.PayloadLength = uint8(copy(msg.Payload[:], limbs[i]))
-		msg.Payload = limbs[i]
-		msg.PayloadLength = uint8(len(limbs[i]))
+		msg.Payload = msgParts[i]
+		msg.PayloadLength = uint8(len(msgParts[i]))
 		var buf bytes.Buffer
 		buf.Reset()
 		if err := struc.Pack(&buf, &msg); err != nil {
@@ -241,14 +254,18 @@ func PreparePartitionedPayload(msgMetadata PacketMetaData, msgConnID ConnID, pay
 
 		s := cryptography.EncodeBytes(encrypted)
 
-		fqdn := insertNth(s, 60)
+		// as per DNS specification, the maximum length of a subdomain is 64 characters
+		fqdn := insertNth(s, 63)
 		response = append(response, FQDN(fqdn+dnsSuffix))
 		msg.PartID++
 	}
-	return response, msg.ConnID, err
+	return response, msg.ConnID, nil
 }
 
-// returns a list of subdomains from a dns message. if the msg type is answer, only answers are returned, otherwise only questions
+// getSubdomainsFromDNSMessage parses a dns message and converts it into a list of FQDNs
+// given the design of dnsConn, only A queries and CNAME responses are expected
+// since standard DNS clients return the question as part of a response message, we need to be able to
+// discard the question when there's answer RR in the msg
 func getSubdomainsFromDNSMessage(m *dns.Msg) []string {
 	var res []string
 	if len(m.Answer) > 0 {
@@ -269,7 +286,10 @@ func getSubdomainsFromDNSMessage(m *dns.Msg) []string {
 // note that in the current implementation, MessagePacketWithSignature is a list of one
 func DecryptIncomingPacket(m *dns.Msg, suffix string, privatekey *cryptography.PrivateKey, publickey *cryptography.PublicKey) ([]MessagePacketWithSignature, bool, error) {
 	out := []MessagePacketWithSignature{}
-	listOfSubdomains := getSubdomainsFromDNSMessage(m) // in this implementation, each response is only one CNAME, so we expect this list to be of length 1
+	// in the current implementation, each request or response is only one A/CNAME record
+	// so we expect this list to be of length 1, however, this function ignores this fact
+	// and loops anyway.
+	listOfSubdomains := getSubdomainsFromDNSMessage(m)
 	for _, sub := range listOfSubdomains {
 		if strings.HasSuffix(sub, suffix) {
 
@@ -298,7 +318,7 @@ func DecryptIncomingPacket(m *dns.Msg, suffix string, privatekey *cryptography.P
 			msgRaw := strings.Replace(requestWithoutSuffix, ".", "", -1)
 			// // padding
 			// if i := len(msgRaw) % 8; i != 0 {
-			// 	msgRaw += strings.Repeat("=", 8-i)w
+			// 	msgRaw += strings.Repeat("=", 8-i)
 			// }
 
 			msg := cryptography.DecodeToBytes(msgRaw)
@@ -307,25 +327,30 @@ func DecryptIncomingPacket(m *dns.Msg, suffix string, privatekey *cryptography.P
 			if !DedupHashTable.Add(msg) {
 				return out, true, fmt.Errorf("duplicate message")
 			}
-
-			decrypted, err := privatekey.Decrypt(msg)
+			var decrypted []byte
+			var err error
+			if publickey == nil {
+				decrypted, err = privatekey.Decrypt(msg)
+				if err != nil {
+					return out, false, err
+				}
+			} else {
+				decrypted, err = privatekey.DecryptAndVerify(msg, publickey)
+			}
 			if err != nil {
 				//todo: since a lot of these are noise and duplicates, maybe we can skip putting this as error
 				// when a DNS client sends a request like a.b.c.d.myc2.com, some recurisve DNS
 				// server don't pass that on to the NS server. instead, they start by sending
 				// d.myc2.com, then c.d.myc2.com and so on, making our job quite difficult
-				// log.Infof("%s, %s", msg, msgRaw) //todo:remove
 				return out, false, err
 			}
 
-			// todo: verify authenticity with public key(s)
 			o := MessagePacketWithSignature{}
 			o.Signature = cryptography.GetPublicKeyFromMessage(msg)
 			err = struc.Unpack(bytes.NewBuffer(decrypted), &o.Msg)
 			if err != nil {
 				return out, false, errors.New("couldn't unpack message")
 			}
-			// fmt.Printf("Decrypted: %#+v\n", o.Msg) //todo:remove
 			out = append(out, o)
 		}
 	}
@@ -360,7 +385,6 @@ func CheckMessageIntegrity(packets []MessagePacketWithSignature) []MessagePacket
 }
 
 // FNV1A a very fast hashing function, mainly used for de-duplication
-// TODO: explore cityhash and murmurhash
 func FNV1A(input []byte) uint64 {
 	var hash uint64 = 0xcbf29ce484222325
 	var fnvPrime uint64 = 0x100000001b3

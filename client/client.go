@@ -1,4 +1,4 @@
-package dnsconn
+package client
 
 import (
 	"bytes"
@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -21,12 +22,13 @@ type clientConn struct {
 	serverPublicKey *cryptography.PublicKey  // public key of the server for verifying the signature of the messages and encrypting the payload
 	dnsSuffix       string                   // the dns suffix of the server. each message sent will be a random string with this suffix at the end
 	resolver        net.Addr                 // DNS resolver to use to make the A queries over. currently, only plain UDP is supported. TODO: add encrypted DNS
+	logger          *slog.Logger             // logger to use for logging
 
 	// read related fields
 	timeout       time.Duration                                               // used in the startRead goroutine to make sure to close the connections that don't have a response from the server whatsoever
 	readInterval  time.Duration                                               // used in the startRead goroutine to configure the interval between sending read requests
 	readPacketBuf map[transport.ConnID][]transport.MessagePacketWithSignature // buffer for incoming DNS packets so we can re-order and dedup before pushing to the actual bytes array
-	readBuf       []byte                                                      // raw bytes buffer. TODO: add max size
+	readBuf       chan []byte                                                 // raw bytes buffer. TODO: add max size
 	readCtx       context.Context                                             // used in Read function when setReadDeadline is used
 	readLock      sync.Mutex                                                  // used to lock the readBuf
 	connected     chan struct{}
@@ -91,7 +93,7 @@ func (c *clientConn) sendQuestionToServer(Q transport.FQDN) error {
 			// if the packet from the server is the last part, we can start reconstructing the payload
 			if msg.Msg.Metadata.IsLastPart() {
 				if incomingPayload, err := c.grabFullPayload(msg.Msg.ConnID); err == nil {
-					c.readBuf = append(c.readBuf, incomingPayload...)
+					c.readBuf <- incomingPayload
 					c.readLock.Unlock()
 				}
 				// this is where the Read() function can stop blocking
@@ -114,6 +116,7 @@ type clientConfig struct {
 	resolver        net.Addr
 	timeout         time.Duration
 	readInterval    time.Duration
+	logger          *slog.Logger
 }
 
 // WithPrivateKey sets the private key
@@ -158,6 +161,13 @@ func WithReadInterval(interval time.Duration) ClientOption {
 	}
 }
 
+// WithLogger sets the logger
+func WithLogger(logger *slog.Logger) ClientOption {
+	return func(c *clientConfig) {
+		c.logger = logger
+	}
+}
+
 // DialDNST creates a new DNS Tunnel client using functional options
 func DialDNST(opts ...ClientOption) (net.Conn, error) {
 	// Default configuration
@@ -178,6 +188,9 @@ func DialDNST(opts ...ClientOption) (net.Conn, error) {
 	if cfg.dnsSuffix == "" {
 		return nil, fmt.Errorf("DNS suffix is required")
 	}
+	if cfg.logger == nil {
+		cfg.logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{}))
+	}
 
 	// Generate private key if not provided
 	if cfg.privateKey == nil {
@@ -194,11 +207,12 @@ func DialDNST(opts ...ClientOption) (net.Conn, error) {
 		serverPublicKey: cfg.serverPublicKey,
 		dnsSuffix:       cfg.dnsSuffix,
 		resolver:        cfg.resolver,
+		logger:          cfg.logger,
 	}
 
 	// Initialize remaining fields
 	client.readPacketBuf = make(map[transport.ConnID][]transport.MessagePacketWithSignature)
-	client.readBuf = make([]byte, 0)
+	client.readBuf = make(chan []byte, 1)
 	client.readCtx = context.Background()
 	client.readLock = sync.Mutex{}
 	client.readInterval = cfg.readInterval
@@ -226,13 +240,13 @@ func (c *clientConn) startWrite() {
 			// we expect questions to be an array of one, since the payload is empty
 			questions, _, err := transport.PreparePartitionedPayload(metadata, c.connID, payload, c.dnsSuffix, c.privateKey, c.serverPublicKey)
 			if err != nil {
-				slog.Error("failed to prepare payload",
+				c.logger.Error("failed to prepare payload",
 					"error", err)
 			}
 			// send the close payload to the server
 			err = c.sendQuestionToServer(questions[0])
 			if err != nil {
-				slog.Error("failed to send close payload",
+				c.logger.Error("failed to send close payload",
 					"error", err)
 			}
 			return
@@ -244,13 +258,13 @@ func (c *clientConn) startWrite() {
 
 				questions, _, err := transport.PreparePartitionedPayload(metadata, c.connID, c.writeBuf, c.dnsSuffix, c.privateKey, c.serverPublicKey)
 				if err != nil {
-					slog.Error("failed to prepare payload",
+					c.logger.Error("failed to prepare payload",
 						"error", err)
 				}
 				for _, question := range questions {
 					err := c.sendQuestionToServer(question)
 					if err != nil {
-						slog.Error("failed to send question",
+						c.logger.Error("failed to send question",
 							"error", err)
 					}
 				}
@@ -272,18 +286,18 @@ func (c *clientConn) startRead() {
 		case <-c.readCtx.Done():
 			return
 		case <-ticker.C:
-			metadata := transport.PacketMetaData(0).SetIsServer2Client(true).SetIsKeepAlive(true)
+			metadata := transport.PacketMetaData(transport.NoMetadata).SetIsServer2Client(true).SetIsKeepAlive(true)
 			payload := []byte("ping!")
 			// we expect questions to be an array of one, since the payload is empty
 			questions, _, err := transport.PreparePartitionedPayload(metadata, c.connID, payload, c.dnsSuffix, c.privateKey, c.serverPublicKey)
 			if err != nil {
-				slog.Error("failed to prepare payload",
+				c.logger.Error("failed to prepare payload",
 					"error", err)
 			}
 			// send the healthcheck to the server. the response of this has the server payload inside of it.
 			err = c.sendQuestionToServer(questions[0])
 			if err != nil {
-				slog.Error("failed to send healthcheck",
+				c.logger.Error("failed to send healthcheck",
 					"error", err)
 			}
 			c.connected <- struct{}{}
@@ -295,8 +309,11 @@ func (c *clientConn) startRead() {
 func (c *clientConn) Read(b []byte) (n int, err error) {
 	c.readLock.Lock()
 	defer c.readLock.Unlock()
-	n = copy(b, c.readBuf)
-	c.readBuf = c.readBuf[n:]
+	buf := <-c.readBuf
+	if len(buf) == 0 {
+		return 0, fmt.Errorf("no data to read")
+	}
+	n = copy(b, buf)
 
 	return
 }
@@ -319,11 +336,11 @@ func (c *clientConn) Close() error {
 
 // LocalAddr returns the local network address
 func (c *clientConn) LocalAddr() net.Addr {
-	return &DNSTAddr{pubKey: c.privateKey.GetPublicKey()}
+	return transport.NewDNSTAddr(c.privateKey.GetPublicKey())
 }
 
 func (c *clientConn) RemoteAddr() net.Addr {
-	return &DNSTAddr{pubKey: *c.serverPublicKey}
+	return transport.NewDNSTAddr(*c.serverPublicKey)
 }
 
 func (c *clientConn) SetDeadline(t time.Time) error {
