@@ -58,11 +58,11 @@ type Server struct {
 	logger           *slog.Logger
 }
 
-// ServerOption defines the type for functional options
-type ServerOption func(*serverConfig)
+// Option defines the type for functional options
+type Option func(*config)
 
-// serverConfig holds all configurable options
-type serverConfig struct {
+// config holds all configurable options
+type config struct {
 	privateKey         *cryptography.PrivateKey
 	listener           net.PacketConn
 	dnsSuffix          string
@@ -71,52 +71,52 @@ type serverConfig struct {
 	logger             *slog.Logger
 }
 
-// WithServerPrivateKey sets the server's private key
-func WithServerPrivateKey(key *cryptography.PrivateKey) ServerOption {
-	return func(c *serverConfig) {
+// WithPrivateKey sets the server's private key
+func WithPrivateKey(key *cryptography.PrivateKey) Option {
+	return func(c *config) {
 		c.privateKey = key
 	}
 }
 
 // WithListener sets the DNS packet listener
-func WithListener(listener net.PacketConn) ServerOption {
-	return func(c *serverConfig) {
+func WithListener(listener net.PacketConn) Option {
+	return func(c *config) {
 		c.listener = listener
 	}
 }
 
-// WithServerDNSSuffix sets the DNS suffix
-func WithServerDNSSuffix(suffix string) ServerOption {
-	return func(c *serverConfig) {
+// WithDNSSuffix sets the DNS suffix
+func WithDNSSuffix(suffix string) Option {
+	return func(c *config) {
 		c.dnsSuffix = suffix
 	}
 }
 
 // WithAcceptedClientKeys sets the allowed client public keys
-func WithAcceptedClientKeys(keys ...*cryptography.PublicKey) ServerOption {
-	return func(c *serverConfig) {
+func WithAcceptedClientKeys(keys ...*cryptography.PublicKey) Option {
+	return func(c *config) {
 		c.acceptedClientKeys = keys
 	}
 }
 
 // WithCleanupInterval sets the interval for cleaning up idle clients
-func WithCleanupInterval(interval time.Duration) ServerOption {
-	return func(c *serverConfig) {
+func WithCleanupInterval(interval time.Duration) Option {
+	return func(c *config) {
 		c.cleanupInterval = interval
 	}
 }
 
 // WithLogger sets the logger
-func WithLogger(logger *slog.Logger) ServerOption {
-	return func(c *serverConfig) {
+func WithLogger(logger *slog.Logger) Option {
+	return func(c *config) {
 		c.logger = logger
 	}
 }
 
 // ListenDNST creates a new DNS Tunnel server using functional options
-func ListenDNST(opts ...ServerOption) (net.Listener, error) {
+func ListenDNST(opts ...Option) (net.Listener, error) {
 	// Default configuration
-	cfg := &serverConfig{
+	cfg := &config{
 		cleanupInterval: defaultCleanupInterval,
 	}
 
